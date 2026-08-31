@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,18 +13,28 @@ import requests
 
 API_URL = "https://remotive.com/api/remote-jobs"
 DEFAULT_CATEGORY = "software-dev"
-DEFAULT_KEYWORDS = (
-    "IT Operations",
-    "automation",
-    "DevOps",
-    "cloud",
-    "platform engineer",
-    "SRE",
-    "Python",
-)
 DEFAULT_SEEN_JOBS_FILE = "seen_jobs.json"
 REQUEST_TIMEOUT_SECONDS = 15
 
+STRONG_KEYWORDS = (
+    "IT Operations",
+    "DevOps",
+    "SRE",
+    "platform engineer",
+    "site reliability",
+)
+WEAK_KEYWORDS = (
+    "automation",
+    "cloud",
+    "Python",
+    "infrastructure",
+)
+
+STRONG_TITLE_WEIGHT = 6
+STRONG_DESCRIPTION_WEIGHT = 3
+WEAK_TITLE_WEIGHT = 2
+WEAK_DESCRIPTION_WEIGHT = 1
+DEFAULT_MIN_SCORE = 6  # at least one strong signal required
 
 Job = dict[str, Any]
 
@@ -82,18 +93,46 @@ def fetch_jobs() -> list[Job]:
     return [job for job in jobs if isinstance(job, dict)]
 
 
+def _compile_keyword_patterns(keywords: tuple[str, ...]) -> list[re.Pattern[str]]:
+    """Compile case-insensitive, whole-word patterns for each keyword."""
+    return [re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in keywords]
+
+
+def score_job(
+    job: Job,
+    strong_patterns: list[re.Pattern[str]],
+    weak_patterns: list[re.Pattern[str]],
+) -> int:
+    """Score a job by keyword hits in its TITLE only.
+
+    Titles are reliable; descriptions (especially from staffing agencies)
+    often repeat a generic stack blurb across unrelated roles, so they are
+    intentionally ignored for the match decision.
+    """
+    title = job.get("title", "") or ""
+    score = 0
+    for pattern in strong_patterns:
+        if pattern.search(title):
+            score += STRONG_TITLE_WEIGHT
+    for pattern in weak_patterns:
+        if pattern.search(title):
+            score += WEAK_TITLE_WEIGHT
+    return score
+
+
 def filter_jobs(jobs: list[Job]) -> list[Job]:
-    """Return jobs whose title or description contains at least one keyword."""
-    keywords = tuple(keyword.casefold() for keyword in get_keywords())
-    matches: list[Job] = []
+    """Return matching jobs, most relevant first, above the minimum score."""
+    min_score = int(os.getenv("MIN_SCORE", DEFAULT_MIN_SCORE))
+    strong_patterns = _compile_keyword_patterns(STRONG_KEYWORDS)
+    weak_patterns = _compile_keyword_patterns(WEAK_KEYWORDS)
 
-    for job in jobs:
-        searchable_text = f"{job.get('title', '')} {job.get('description', '')}".casefold()
-        if any(keyword in searchable_text for keyword in keywords):
-            matches.append(job)
-
-    return matches
-
+    scored = ((score_job(job, strong_patterns, weak_patterns), job) for job in jobs)
+    matches = sorted(
+        (pair for pair in scored if pair[0] >= min_score),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    return [job for _, job in matches]
 
 def load_seen_ids() -> set[str]:
     """Load previously seen job IDs from local JSON storage."""
